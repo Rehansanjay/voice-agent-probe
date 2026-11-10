@@ -34,6 +34,10 @@ class SpeechDetector:
     """
 
     threshold: float = 0.5
+    # Phone lines carry hum and hiss that Silero half-believes is a voice; on
+    # one real call it scored 0.3-0.7 at a tenth of speech level. A window
+    # must also be this loud to count.
+    min_rms: float = 500.0
     onset_windows: int = 3
     end_silence_s: float = 0.8
     spans: list[Span] = field(default_factory=list)
@@ -71,7 +75,7 @@ class SpeechDetector:
         conf = float(np.asarray(self._vad.voice_confidence(window)).reshape(-1)[0])
         self.confidences.append((t0, conf))
         t1 = t0 + WINDOW_S
-        if conf >= self.threshold:
+        if conf >= self.threshold and pcm_rms(window) >= self.min_rms:
             if self._run == 0:
                 self._run_start = t0
             self._run += 1
@@ -87,6 +91,9 @@ class SpeechDetector:
         """End an open span at the last speech seen, e.g. when the call drops."""
         if self.speaking:
             self.spans[-1].end = self._last_speech_end or at
+
+    def longest_span(self) -> float:
+        return max((s.end - s.start for s in self.spans if s.end is not None), default=0.0)
 
     def first_onset_after(self, t: float) -> float | None:
         for s in self.spans:

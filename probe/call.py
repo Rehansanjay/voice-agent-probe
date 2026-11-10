@@ -67,6 +67,7 @@ class Result:
     bargein: str = "not tested"
     bargein_stop_after_s: float | None = None
     spoke_over_us: int = 0
+    longest_turn_s: float | None = None
     call_seconds: float | None = None
     end_reason: str | None = None
     transcript: str | None = None
@@ -254,14 +255,20 @@ async def run_script(call: Call, result: Result) -> None:
     def left() -> float:
         return CALL_BUDGET_S - (call.now() - answered_at)
 
-    # 1. Greeting: most agents speak first.
-    onset = await call.wait_onset(answered_at, timeout=min(8.0, left()))
+    async def let_it_finish(what: str) -> None:
+        # Never start a line over the agent: that measures our manners, not its.
+        if not await call.wait_quiet(timeout=min(20.0, max(0.0, left() - 8))):
+            result.notes.append(f"agent was still talking after 20 s ({what}); we spoke over it")
+
+    # 1. Greeting: most agents speak first. Audio is timestamped by arrival, so
+    # a greeting that starts with the stream can land a few ms before the
+    # start event; look from just before it.
+    onset = await call.wait_onset(answered_at - 0.5, timeout=min(8.0, left()))
     if onset is None:
         result.notes.append("agent said nothing in the first 8 s; we spoke first")
     else:
-        result.greeting_after_s = round(onset - answered_at, 2)
-        if not await call.wait_quiet(timeout=min(15.0, left())):
-            result.notes.append("greeting still going after 15 s")
+        result.greeting_after_s = round(max(0.0, onset - answered_at), 2)
+        await let_it_finish("greeting")
         span = call.det.spans[0]
         if span.end is not None:
             result.greeting_len_s = round(span.end - span.start, 2)
@@ -274,7 +281,7 @@ async def run_script(call: Call, result: Result) -> None:
             result.notes.append("no reply to the first question within 8 s")
         else:
             result.q1_reply_after_s = round(onset - q1_end, 2)
-            await call.wait_quiet(timeout=min(15.0, left()))
+            await let_it_finish("first answer")
 
     # 3. A question that needs a long answer, then talk over the answer.
     if left() > 10 and not call.closed.is_set():
@@ -303,6 +310,8 @@ async def run_script(call: Call, result: Result) -> None:
                     result.bargein_stop_after_s = round(end - t_int, 2)
                 else:
                     result.bargein = "kept talking for 4 s+"
+
+    result.longest_turn_s = round(call.det.longest_span(), 2) or None
 
     # Count replies that started while we were mid-line, outside the barge-in test.
     our_spans = _spans_of(call.outbound)
@@ -349,6 +358,7 @@ def markdown(r: Result) -> str:
         ("Reply to a longer question after", s(r.q2_reply_after_s)),
         ("When talked over", r.bargein + (f", after {r.bargein_stop_after_s:.2f} s" if r.bargein_stop_after_s is not None else "")),
         ("Started talking while we were mid-sentence", str(r.spoke_over_us)),
+        ("Longest time talking without a break", s(r.longest_turn_s)),
         ("Call length", s(r.call_seconds)),
     ]
     out = [f"# {r.label}: call to {r.to}", "", "| | |", "|---|---|"]
