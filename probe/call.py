@@ -129,18 +129,23 @@ async def transcribe(pcm: bytes) -> str | None:
     """What the agent said, from Deepgram's prerecorded API. Best effort."""
     if not pcm:
         return None
-    url = "https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true&language=multi"
+    # Raw PCM needs its encoding spelled out in the query; a Content-Type alone
+    # is not enough for Deepgram, which then returns nothing.
+    url = (
+        "https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true&language=multi"
+        "&encoding=linear16&sample_rate=8000&channels=1"
+    )
     headers = {
         "Authorization": f"Token {os.environ['DEEPGRAM_API_KEY']}",
-        "Content-Type": "audio/l16;rate=8000;channels=1",
+        "Content-Type": "application/octet-stream",
     }
     try:
         async with aiohttp.ClientSession() as http:
             async with http.post(url, data=pcm, headers=headers) as r:
-                data = await r.json()
+                data = await r.json(content_type=None)
         return data["results"]["channels"][0]["alternatives"][0]["transcript"]
-    except Exception:
-        return None
+    except Exception as e:
+        return f"(transcription failed: {type(e).__name__})"
 
 
 class Call:
