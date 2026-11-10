@@ -1,0 +1,8 @@
+pipecat-ai[silero]>=1.0  # only for its bundled Silero VAD model
+fastapi>=0.110
+uvicorn[standard]>=0.29
+aiohttp>=3.9
+numpy>=1.26
+python-dotenv>=1.0
+websockets>=12  # tests/rehearse.py
+audioop-lts>=0.2; python_version >= "3.13"

@@ -1,15 +1,19 @@
 """Rehearse the probe against a fake agent whose timing is known, before calling anyone.
 
-The fake plays EnableX's side of the websocket and behaves like a voice agent:
-greets 0.5 s after the stream starts, replies REPLY_DELAY after our line ends
-(it notices the end after END_GAP of no audio from us), and when talked over
-for BARGE_NOTICE it stops BARGE_STOP later. It streams silence between
-utterances, as a real call does. The probe's numbers should land on those,
-within the 32 ms detector window and a frame or two of pacing.
+The fake plays the telephony provider's side of the websocket and behaves like
+a voice agent: greets 0.5 s after the stream starts, replies REPLY_DELAY after
+our line ends (it notices the end after END_GAP of no audio from us), and when
+talked over for BARGE_NOTICE it stops BARGE_STOP later. It streams silence
+between utterances, as a real call does. The probe's numbers should land on
+those, within the 32 ms detector window and a frame or two of pacing.
 
-    python -m tests.rehearse
+    python -m tests.rehearse                  # both providers
+    python -m tests.rehearse --provider twilio
+
+Places no calls and needs no accounts.
 """
 
+import argparse
 import asyncio
 import audioop
 import base64
@@ -21,6 +25,7 @@ import uvicorn
 import websockets
 
 import probe.call as pc
+from probe.providers import PROVIDERS
 
 GREET_DELAY = 0.5
 END_GAP = 0.3
@@ -28,26 +33,41 @@ REPLY_DELAY = 1.0
 BARGE_NOTICE = 0.4
 BARGE_STOP = 0.5
 
-GREETING = "Hello, thanks for calling Acme. How can I help you today?"
-ANSWER = "I can help you book appointments and answer questions about our services."
-LONG = (
-    "Sure. First you tell me what you need, then I check the calendar for open slots, "
-    "then I read the options back to you, and finally I confirm the booking and send a text message."
-)
+CLIPS = Path(__file__).parent / "clips"
 
 
-async def fake_agent(port: int, clips: dict[str, bytes], log: dict):
+# What each provider sends the probe: the agent's side of the wire.
+WIRE = {
+    "enablex": {
+        "hello": [{"event": "connected"},
+                  {"event": "start_media", "stream_id": "s1", "start": {"stream_id": "s1", "voice_id": "v1"}}],
+        "media": lambda b64: {"event": "media", "media": {"payload": b64}},
+        "stop": {"event": "stop_media"},
+    },
+    "twilio": {
+        "hello": [{"event": "connected", "protocol": "Call", "version": "1.0.0"},
+                  {"event": "start", "sequenceNumber": "1", "streamSid": "MZ1",
+                   "start": {"streamSid": "MZ1", "callSid": "CA1", "tracks": ["inbound"],
+                             "mediaFormat": {"encoding": "audio/x-mulaw", "sampleRate": 8000, "channels": 1}}}],
+        "media": lambda b64: {"event": "media", "streamSid": "MZ1",
+                              "media": {"track": "inbound", "payload": b64}},
+        "stop": {"event": "stop", "streamSid": "MZ1"},
+    },
+}
+
+
+async def fake_agent(port: int, wire: dict, clips: dict[str, bytes], log: dict):
     async with websockets.connect(f"ws://127.0.0.1:{port}/ws") as ws:
-        await ws.send(json.dumps({"event": "connected"}))
-        await ws.send(json.dumps({"event": "start_media", "stream_id": "s1",
-                                  "start": {"stream_id": "s1", "voice_id": "v1"}}))
-        t0 = time.monotonic()
+        for msg in wire["hello"]:
+            await ws.send(json.dumps(msg))
         last_heard = [0.0]
         heard_since = [None]
 
         async def listen():
             async for raw in ws:
-                if json.loads(raw).get("event") == "media":
+                msg = json.loads(raw)
+                if msg.get("event") == "media":
+                    log["sent_shape"] = sorted(msg)
                     now = time.monotonic()
                     if heard_since[0] is None or now - last_heard[0] > END_GAP:
                         heard_since[0] = now
@@ -57,7 +77,7 @@ async def fake_agent(port: int, clips: dict[str, bytes], log: dict):
         silence = audioop.lin2ulaw(b"\x00\x00" * 160, 2)
 
         async def send(ulaw: bytes):
-            await ws.send(json.dumps({"event": "media", "media": {"payload": base64.b64encode(ulaw).decode()}}))
+            await ws.send(json.dumps(wire["media"](base64.b64encode(ulaw).decode())))
 
         async def speak(pcm: bytes, interruptible=False) -> str:
             ulaw = audioop.lin2ulaw(pcm, 2)
@@ -105,29 +125,31 @@ async def fake_agent(port: int, clips: dict[str, bytes], log: dict):
         log["long"] = await speak(clips["long"], interruptible=True)
         await silent(3.0)
         listener.cancel()
-        await ws.send(json.dumps({"event": "stop_media"}))
+        await ws.send(json.dumps(wire["stop"]))
 
 
-async def main():
-    cache = Path("results/.tts")
-    lines = {k: pc.trim_silence(await pc.tts_pcm(v, cache)) for k, v in pc.LINES.items()}
-    clips = {"greeting": await pc.tts_pcm(GREETING, cache), "answer": await pc.tts_pcm(ANSWER, cache),
-             "long": await pc.tts_pcm(LONG, cache)}
+async def rehearse(name: str, port: int) -> bool:
+    clips = {k: pc.read_wav(CLIPS / f"{k}.wav") for k in ("greeting", "answer", "long")}
+    provider = PROVIDERS[name]()
 
-    async def no_api(*a, **k):
-        return 200, {}
+    log = {}
 
-    pc.enablex = no_api  # nothing here may reach the real EnableX API
-    result = pc.Result(label="rehearsal", to="fake")
-    state = {"host": "x", "lines": lines, "result": result, "events": [], "over": asyncio.Event(),
-             "t0": time.monotonic(), "call": None}
-    port = 8797
+    async def no_dial(*a, **k):
+        raise AssertionError("the rehearsal must not reach a real provider")
+
+    async def fake_hangup(call_id):
+        # The probe hangs up when its script ends; the fake just notes it.
+        log["hung_up"] = call_id
+
+    provider.dial, provider.hangup = no_dial, fake_hangup
+    result = pc.Result(label="rehearsal", to="fake", provider=name)
+    state = {"host": "x", "lines": pc.load_lines(), "result": result, "events": [], "provider": provider,
+             "budget_s": 40.0, "over": asyncio.Event(), "t0": time.monotonic(), "call": None}
     server = uvicorn.Server(uvicorn.Config(pc.build_app(state), host="127.0.0.1", port=port, log_level="warning"))
     serving = asyncio.create_task(server.serve())
     while not server.started:
         await asyncio.sleep(0.05)
-    log = {}
-    await fake_agent(port, clips, log)
+    await fake_agent(port, WIRE[name], clips, log)
     await asyncio.sleep(2)
     server.should_exit = True
     await serving
@@ -148,7 +170,23 @@ async def main():
     ok &= good
     print(f"{'OK ' if good else 'BAD'} barge-in: measured {result.bargein} after {result.bargein_stop_after_s}, "
           f"fake stopped {log.get('barge_true')} s after first hearing us (built in {BARGE_NOTICE + BARGE_STOP})")
-    print("RESULT:", "PASS" if ok else "FAIL")
+    want_id = {"enablex": "v1", "twilio": "CA1"}[name]
+    good = log.get("hung_up") == want_id and result.call_id == want_id
+    ok &= good
+    print(f"{'OK ' if good else 'BAD'} call id {result.call_id}, hung up {log.get('hung_up')}")
+    print(f"     our media messages carried: {log.get('sent_shape')}")
+    print(f"{name}:", "PASS" if ok else "FAIL", "\n")
+    return ok
+
+
+async def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--provider", choices=sorted(PROVIDERS))
+    args = p.parse_args()
+    names = [args.provider] if args.provider else sorted(PROVIDERS)
+    results = [await rehearse(n, 8797 + i) for i, n in enumerate(names)]
+    print("RESULT:", "PASS" if all(results) else "FAIL")
+    raise SystemExit(0 if all(results) else 1)
 
 
 if __name__ == "__main__":

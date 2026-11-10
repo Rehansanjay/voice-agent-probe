@@ -1,9 +1,9 @@
 """Call a voice agent's phone number and measure how it behaves, the way a caller hears it.
 
-    python -m probe.call --to 91XXXXXXXXXX --label acme-demo
+    python -m probe.call --to +14155550100 --label acme-demo
 
-Places an outbound call through EnableX, streams the call audio over a
-websocket, and runs a short scripted conversation against whatever answers:
+Places an outbound call through Twilio or EnableX, streams the call audio over
+a websocket, and runs a short scripted conversation against whatever answers:
 
 1. greeting   how long until the agent says anything after it picks up
 2. question   how long it takes to answer a simple question
@@ -16,16 +16,14 @@ includes the phone network both ways: it is what a caller experiences.
 Writes results/<when>_<label>.{json,md,wav}. The wav is stereo: the agent on
 the left, our side on the right, lined up in time.
 
-Needs ENABLEX_APP_ID, ENABLEX_APP_KEY, ENABLEX_FROM_NUMBER and
-DEEPGRAM_API_KEY in the environment or a .env file, and a running
-`ngrok http 8765` (or --host).
+Needs the provider's credentials in the environment or a .env file (see
+.env.example), and a running `ngrok http 8765` (or --host). With
+DEEPGRAM_API_KEY set, the report also says what the agent said.
 """
 
 import argparse
 import asyncio
 import audioop
-import base64
-import hashlib
 import json
 import os
 import time
@@ -37,16 +35,18 @@ import aiohttp
 import numpy as np
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from probe.detector import RATE, SpeechDetector
+from probe.providers import PROVIDERS, Media, Provider, Start, Stop
 
 load_dotenv()
 
-API = "https://api.enablex.io/voice/v1/call"
 CHUNK = 160  # 20 ms of 8 kHz mu-law
-CALL_BUDGET_S = 40.0  # EnableX trial calls are cut at 45 s
+LINES_DIR = Path(__file__).parent / "lines"
 
+# What the probe says. The recordings are probe/lines/<name>.wav (8 kHz,
+# 16-bit, mono); `python -m probe.make_lines` regenerates them from this text.
 LINES = {
     "q1": "Hi, what can you help me with?",
     "q2": "Okay. Can you explain how that works, step by step?",
@@ -58,7 +58,8 @@ LINES = {
 class Result:
     label: str
     to: str
-    voice_id: str | None = None
+    provider: str = ""
+    call_id: str | None = None
     answered: bool = False
     greeting_after_s: float | None = None
     greeting_len_s: float | None = None
@@ -74,20 +75,15 @@ class Result:
     notes: list[str] = field(default_factory=list)
 
 
-def auth_headers() -> dict:
-    token = base64.b64encode(
-        f"{os.environ['ENABLEX_APP_ID']}:{os.environ['ENABLEX_APP_KEY']}".encode()
-    ).decode()
-    return {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
+def read_wav(path: Path) -> bytes:
+    with wave.open(str(path), "rb") as w:
+        if (w.getnchannels(), w.getsampwidth(), w.getframerate()) != (1, 2, RATE):
+            raise SystemExit(f"{path}: needs to be mono, 16-bit, {RATE} Hz")
+        return w.readframes(w.getnframes())
 
 
-async def enablex(method: str, path: str, body: dict | None = None):
-    async with aiohttp.ClientSession() as http:
-        async with http.request(method, f"{API}{path}", json=body, headers=auth_headers()) as r:
-            try:
-                return r.status, await r.json(content_type=None)
-            except Exception:
-                return r.status, await r.text()
+def load_lines() -> dict[str, bytes]:
+    return {name: trim_silence(read_wav(LINES_DIR / f"{name}.wav")) for name in LINES}
 
 
 def trim_silence(pcm: bytes, keep_s: float = 0.03, level: float = 0.02) -> bytes:
@@ -106,29 +102,9 @@ def speech_lead_s(pcm: bytes, level: float = 0.02) -> float:
     return float(loud[0]) / RATE if loud.size else 0.0
 
 
-async def tts_pcm(text: str, cache: Path) -> bytes:
-    """8 kHz 16-bit mono PCM for a line, from Deepgram, cached on disk."""
-    # hashlib, not hash(): str hashes change every run, which re-fetched every line.
-    path = cache / f"{hashlib.sha1(text.encode()).hexdigest()[:16]}.pcm"
-    if path.exists():
-        return path.read_bytes()
-    url = (
-        "https://api.deepgram.com/v1/speak?model=aura-2-thalia-en"
-        "&encoding=linear16&sample_rate=8000&container=none"
-    )
-    headers = {"Authorization": f"Token {os.environ['DEEPGRAM_API_KEY']}"}
-    async with aiohttp.ClientSession() as http:
-        async with http.post(url, json={"text": text}, headers=headers) as r:
-            r.raise_for_status()
-            pcm = await r.read()
-    cache.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(pcm)
-    return pcm
-
-
 async def transcribe(pcm: bytes) -> str | None:
-    """What the agent said, from Deepgram's prerecorded API. Best effort."""
-    if not pcm:
+    """What the agent said, from Deepgram's prerecorded API, if a key is set. Best effort."""
+    if not pcm or not os.environ.get("DEEPGRAM_API_KEY"):
         return None
     # Raw PCM needs its encoding spelled out in the query; a Content-Type alone
     # is not enough for Deepgram, which then returns nothing.
@@ -152,11 +128,12 @@ async def transcribe(pcm: bytes) -> str | None:
 class Call:
     """One call's websocket session: receives the agent, plays our lines, keeps time."""
 
-    def __init__(self, ws: WebSocket, lines: dict[str, bytes]):
+    def __init__(self, ws: WebSocket, lines: dict[str, bytes], provider: Provider):
         self.ws = ws
         self.lines = lines
+        self.provider = provider
         self.det = SpeechDetector()
-        self.voice_id: str | None = None
+        self.call_id: str | None = None
         self.stream_id: str | None = None
         self.seq = 0
         self.t0 = time.monotonic()
@@ -164,7 +141,6 @@ class Call:
         self.outbound: list[tuple[float, bytes]] = []
         self.started = asyncio.Event()
         self.closed = asyncio.Event()
-        self.playing = False
 
     def now(self) -> float:
         return time.monotonic() - self.t0
@@ -172,20 +148,16 @@ class Call:
     async def receive(self):
         try:
             while True:
-                msg = json.loads(await self.ws.receive_text())
-                event = msg.get("event")
-                if event == "start_media":
-                    self.stream_id = msg.get("stream_id")
-                    self.voice_id = (msg.get("start") or {}).get("voice_id")
+                ev = self.provider.parse(json.loads(await self.ws.receive_text()))
+                if isinstance(ev, Start):
+                    self.call_id, self.stream_id = ev.call_id, ev.stream_id
                     self.started.set()
-                elif event == "media":
-                    payload = (msg.get("media") or {}).get("payload")
-                    if payload:
-                        t = self.now()
-                        pcm = audioop.ulaw2lin(base64.b64decode(payload), 2)
-                        self.inbound.append((t, pcm))
-                        self.det.feed(pcm, t)
-                elif event == "stop_media":
+                elif isinstance(ev, Media):
+                    t = self.now()
+                    pcm = audioop.ulaw2lin(ev.ulaw, 2)
+                    self.inbound.append((t, pcm))
+                    self.det.feed(pcm, t)
+                elif isinstance(ev, Stop):
                     break
         except (WebSocketDisconnect, RuntimeError):
             pass
@@ -193,39 +165,21 @@ class Call:
             self.det.close(self.now())
             self.closed.set()
 
-    async def say(self, name: str, stop: asyncio.Event | None = None) -> tuple[float, float]:
+    async def say(self, name: str) -> tuple[float, float]:
         """Play a line in real time. Returns (start, end) in call seconds."""
         pcm = self.lines[name]
         ulaw = audioop.lin2ulaw(pcm, 2)
         start = self.now()
-        self.playing = True
         next_t = time.monotonic()
-        try:
-            for i in range(0, len(ulaw), CHUNK):
-                if self.closed.is_set() or (stop and stop.is_set()):
-                    break
-                self.seq += 1
-                t = self.now()
-                self.outbound.append((t, pcm[i * 2 : (i + CHUNK) * 2]))
-                await self.ws.send_text(
-                    json.dumps(
-                        {
-                            "event": "media",
-                            "voice_id": self.voice_id,
-                            "stream_id": self.stream_id,
-                            "media": {
-                                "seq": self.seq,
-                                "timestamp": int(time.time() * 1000),
-                                "format": {"encoding": "ulaw", "sample_rate": 8000, "channels": 1},
-                                "payload": base64.b64encode(ulaw[i : i + CHUNK]).decode(),
-                            },
-                        }
-                    )
-                )
-                next_t += CHUNK / RATE
-                await asyncio.sleep(max(0.0, next_t - time.monotonic()))
-        finally:
-            self.playing = False
+        for i in range(0, len(ulaw), CHUNK):
+            if self.closed.is_set():
+                break
+            self.seq += 1
+            self.outbound.append((self.now(), pcm[i * 2 : (i + CHUNK) * 2]))
+            msg = self.provider.media(ulaw[i : i + CHUNK], self.stream_id, self.call_id, self.seq)
+            await self.ws.send_text(json.dumps(msg))
+            next_t += CHUNK / RATE
+            await asyncio.sleep(max(0.0, next_t - time.monotonic()))
         return start, self.now()
 
     async def wait_onset(self, after: float, timeout: float) -> float | None:
@@ -247,13 +201,15 @@ class Call:
         return not self.det.speaking
 
 
-async def run_script(call: Call, result: Result) -> None:
+async def run_script(call: Call, result: Result, budget_s: float) -> None:
     """The scripted conversation. Each step is skipped if the call has ended."""
     await asyncio.wait_for(call.started.wait(), 10)
     answered_at = call.now()
+    result.answered = True
+    result.call_id = result.call_id or call.call_id
 
     def left() -> float:
-        return CALL_BUDGET_S - (call.now() - answered_at)
+        return budget_s - (call.now() - answered_at)
 
     async def let_it_finish(what: str) -> None:
         # Never start a line over the agent: that measures our manners, not its.
@@ -361,52 +317,35 @@ def markdown(r: Result) -> str:
         ("Longest time talking without a break", s(r.longest_turn_s)),
         ("Call length", s(r.call_seconds)),
     ]
-    out = [f"# {r.label}: call to {r.to}", "", "| | |", "|---|---|"]
+    out = [f"# {r.label}: call to {r.to} via {r.provider}", "", "| | |", "|---|---|"]
     out += [f"| {k} | {v} |" for k, v in rows]
     out += ["", "Times are measured from the call audio as it arrived, so they include the phone network both ways: what a caller hears."]
     if r.notes:
         out += ["", "Notes:"] + [f"- {n}" for n in r.notes]
     if r.transcript:
         out += ["", "What the agent said:", "", f"> {r.transcript}"]
-    out += ["", f"voice_id: {r.voice_id}"]
+    out += ["", f"call id: {r.call_id}"]
     return "\n".join(out) + "\n"
 
 
 def build_app(state: dict) -> FastAPI:
     app = FastAPI()
-
-    @app.post("/event")
-    async def event(request: Request):
-        body = await request.json()
-        st = body.get("state")
-        state["events"].append((round(time.monotonic() - state["t0"], 2), st))
-        if st == "connected":
-            state["result"].answered = True
-            status, reply = await enablex(
-                "PUT", f"/{body.get('voice_id')}/stream", {"wss_host": f"wss://{state['host']}/ws"}
-            )
-            if status >= 300 or (isinstance(reply, dict) and reply.get("state") == "stream_failed"):
-                state["result"].notes.append(f"stream did not start: HTTP {status} {reply}")
-                await enablex("DELETE", f"/{body.get('voice_id')}")
-        elif st == "disconnected":
-            state["result"].call_seconds = body.get("call_duration")
-            state["result"].end_reason = body.get("disconnect_reason")
-            state["over"].set()
-        return {}
+    provider: Provider = state["provider"]
+    provider.mount(app, state)
 
     @app.websocket("/ws")
     async def ws(websocket: WebSocket):
         await websocket.accept()
-        call = Call(websocket, state["lines"])
+        call = Call(websocket, state["lines"], provider)
         state["call"] = call
         receiver = asyncio.create_task(call.receive())
         try:
-            await run_script(call, state["result"])
+            await run_script(call, state["result"], state["budget_s"])
         except Exception as e:
             state["result"].notes.append(f"script stopped: {type(e).__name__}: {e}")
         finally:
-            if call.voice_id and not call.closed.is_set():
-                await enablex("DELETE", f"/{call.voice_id}")
+            if call.call_id and not call.closed.is_set():
+                await provider.hangup(call.call_id)
             await asyncio.wait([receiver], timeout=5)
 
     return app
@@ -424,21 +363,25 @@ async def ngrok_host() -> str:
 
 async def main():
     p = argparse.ArgumentParser(description="Call a voice agent and measure it.")
-    p.add_argument("--to", required=True, help="number to call, digits only, e.g. 91XXXXXXXXXX")
+    p.add_argument("--to", required=True, help="number to call with country code, e.g. +14155550100")
     p.add_argument("--label", required=True, help="short name for the report, e.g. acme-demo")
+    p.add_argument("--provider", choices=sorted(PROVIDERS), default=os.environ.get("PROBE_PROVIDER", "twilio"),
+                   help="who places the call (default: $PROBE_PROVIDER, else twilio)")
+    p.add_argument("--budget", type=float, help="seconds the conversation may run (default: per provider)")
     p.add_argument("--host", help="public host forwarding to this machine; default: the ngrok tunnel")
     p.add_argument("--port", type=int, default=8765)
     args = p.parse_args()
 
+    provider = PROVIDERS[args.provider]()
+    provider.check_env()
     host = (args.host or await ngrok_host()).removeprefix("https://").rstrip("/")
     if not host:
         raise SystemExit("No public host. Start `ngrok http 8765`, or pass --host.")
 
-    cache = Path("results/.tts")
-    lines = {k: trim_silence(await tts_pcm(v, cache)) for k, v in LINES.items()}
-    result = Result(label=args.label, to=args.to)
+    result = Result(label=args.label, to=args.to, provider=provider.name)
     state = {
-        "host": host, "lines": lines, "result": result, "events": [],
+        "host": host, "lines": load_lines(), "result": result, "events": [], "provider": provider,
+        "budget_s": args.budget or provider.budget_s,
         "over": asyncio.Event(), "t0": time.monotonic(), "call": None,
     }
 
@@ -447,18 +390,14 @@ async def main():
     while not server.started:
         await asyncio.sleep(0.05)
 
-    status, reply = await enablex(
-        "POST", "",
-        {"name": "voice-agent-probe", "owner_ref": args.label, "from": os.environ["ENABLEX_FROM_NUMBER"],
-         "to": args.to, "event_url": f"https://{host}/event"},
-    )
-    print(f"dial-out: HTTP {status} {reply}")
-    if status < 300 and isinstance(reply, dict):
-        result.voice_id = reply.get("voice_id")
+    call_id, log = await provider.dial(args.to, host, args.label)
+    print(log)
+    if call_id:
+        result.call_id = call_id
         try:
-            await asyncio.wait_for(state["over"].wait(), timeout=90)
+            await asyncio.wait_for(state["over"].wait(), timeout=state["budget_s"] + 50)
         except TimeoutError:
-            result.notes.append("no disconnected event within 90 s")
+            result.notes.append("the provider never reported the call ending")
         await asyncio.sleep(1)
 
     server.should_exit = True
