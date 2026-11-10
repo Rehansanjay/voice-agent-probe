@@ -361,16 +361,80 @@ async def ngrok_host() -> str:
     return next((t["public_url"] for t in tunnels if t.get("public_url", "").startswith("https://")), "")
 
 
+async def run_calls(
+    provider: Provider, host: str, to: str, label: str, *, calls: int = 1, gap_s: float = 10.0,
+    budget_s: float | None = None, port: int = 8765, out_dir: Path = Path("results"),
+    with_transcript: bool = True,
+) -> list[Result]:
+    """Place ``calls`` calls one after another, saving a report for each."""
+    state = {
+        "host": host, "lines": load_lines(), "provider": provider,
+        "budget_s": budget_s or provider.budget_s,
+        "result": None, "events": [], "over": asyncio.Event(), "t0": time.monotonic(), "call": None,
+    }
+    server = uvicorn.Server(uvicorn.Config(build_app(state), host="0.0.0.0", port=port, log_level="warning"))
+    serving = asyncio.create_task(server.serve())
+    while not server.started:
+        await asyncio.sleep(0.05)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    results = []
+    try:
+        for i in range(calls):
+            if i:
+                print(f"\nnext call in {gap_s:.0f} s")
+                await asyncio.sleep(gap_s)
+            result = Result(label=label, to=to, provider=provider.name)
+            # Webhooks and the websocket read these at request time, so a fresh
+            # set per call keeps one call's late events out of the next.
+            state.update(result=result, events=[], over=asyncio.Event(), t0=time.monotonic(), call=None)
+
+            call_id, log = await provider.dial(to, host, label)
+            print(f"[{i + 1}/{calls}] {log}")
+            if call_id:
+                result.call_id = call_id
+                try:
+                    await asyncio.wait_for(state["over"].wait(), timeout=state["budget_s"] + 50)
+                except TimeoutError:
+                    result.notes.append("the provider never reported the call ending")
+                await asyncio.sleep(1)
+
+            run = f"_{i + 1}" if calls > 1 else ""
+            stem = out_dir / f"{time.strftime('%Y%m%d-%H%M%S')}_{label}{run}"
+            call: Call | None = state["call"]
+            if call is not None:
+                if with_transcript:
+                    result.transcript = await transcribe(b"".join(pcm for _, pcm in call.inbound))
+                write_wav(stem.with_suffix(".wav"), call)
+            stem.with_suffix(".json").write_text(
+                json.dumps({**asdict(result), "events": state["events"]}, indent=2), encoding="utf-8"
+            )
+            md = markdown(result)
+            stem.with_suffix(".md").write_text(md, encoding="utf-8")
+            print("\n" + md)
+            print(f"saved {stem}.{{json,md,wav}}")
+            results.append(result)
+    finally:
+        server.should_exit = True
+        await serving
+    return results
+
+
 async def main():
     p = argparse.ArgumentParser(description="Call a voice agent and measure it.")
     p.add_argument("--to", required=True, help="number to call with country code, e.g. +14155550100")
-    p.add_argument("--label", required=True, help="short name for the report, e.g. acme-demo")
+    p.add_argument("--label", required=True,
+                   help="name for this agent version, e.g. v1; compare two with `python -m probe.compare v1 v2`")
+    p.add_argument("--calls", type=int, default=1, help="how many calls to make, one after another (default 1)")
+    p.add_argument("--gap", type=float, default=10.0, help="seconds between calls (default 10)")
     p.add_argument("--provider", choices=sorted(PROVIDERS), default=os.environ.get("PROBE_PROVIDER", "twilio"),
                    help="who places the call (default: $PROBE_PROVIDER, else twilio)")
     p.add_argument("--budget", type=float, help="seconds the conversation may run (default: per provider)")
     p.add_argument("--host", help="public host forwarding to this machine; default: the ngrok tunnel")
     p.add_argument("--port", type=int, default=8765)
     args = p.parse_args()
+    if args.calls < 1:
+        raise SystemExit("--calls must be at least 1")
 
     provider = PROVIDERS[args.provider]()
     provider.check_env()
@@ -378,45 +442,10 @@ async def main():
     if not host:
         raise SystemExit("No public host. Start `ngrok http 8765`, or pass --host.")
 
-    result = Result(label=args.label, to=args.to, provider=provider.name)
-    state = {
-        "host": host, "lines": load_lines(), "result": result, "events": [], "provider": provider,
-        "budget_s": args.budget or provider.budget_s,
-        "over": asyncio.Event(), "t0": time.monotonic(), "call": None,
-    }
-
-    server = uvicorn.Server(uvicorn.Config(build_app(state), host="0.0.0.0", port=args.port, log_level="warning"))
-    serving = asyncio.create_task(server.serve())
-    while not server.started:
-        await asyncio.sleep(0.05)
-
-    call_id, log = await provider.dial(args.to, host, args.label)
-    print(log)
-    if call_id:
-        result.call_id = call_id
-        try:
-            await asyncio.wait_for(state["over"].wait(), timeout=state["budget_s"] + 50)
-        except TimeoutError:
-            result.notes.append("the provider never reported the call ending")
-        await asyncio.sleep(1)
-
-    server.should_exit = True
-    await serving
-
-    call: Call | None = state["call"]
-    out = Path("results")
-    out.mkdir(exist_ok=True)
-    stem = out / f"{time.strftime('%Y%m%d-%H%M%S')}_{args.label}"
-    if call is not None:
-        result.transcript = await transcribe(b"".join(pcm for _, pcm in call.inbound))
-        write_wav(stem.with_suffix(".wav"), call)
-    stem.with_suffix(".json").write_text(
-        json.dumps({**asdict(result), "events": state["events"]}, indent=2), encoding="utf-8"
-    )
-    md = markdown(result)
-    stem.with_suffix(".md").write_text(md, encoding="utf-8")
-    print("\n" + md)
-    print(f"saved {stem}.{{json,md,wav}}")
+    await run_calls(provider, host, args.to, args.label, calls=args.calls, gap_s=args.gap,
+                    budget_s=args.budget, port=args.port)
+    if args.calls > 1:
+        print(f"\nsummary: python -m probe.compare {args.label}")
 
 
 if __name__ == "__main__":

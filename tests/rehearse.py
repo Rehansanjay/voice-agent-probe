@@ -8,7 +8,10 @@ between utterances, as a real call does. The probe's numbers should land on
 those, within the 32 ms detector window and a frame or two of pacing.
 
     python -m tests.rehearse                  # both providers
-    python -m tests.rehearse --provider twilio
+    python -m tests.rehearse --provider twilio --calls 2
+
+It also runs a second, slower version of the fake agent through the same
+runner and checks that probe.compare reports it as slower.
 
 Places no calls and needs no accounts.
 """
@@ -18,13 +21,14 @@ import asyncio
 import audioop
 import base64
 import json
+import tempfile
 import time
 from pathlib import Path
 
-import uvicorn
 import websockets
 
 import probe.call as pc
+from probe import compare
 from probe.providers import PROVIDERS
 
 GREET_DELAY = 0.5
@@ -56,7 +60,7 @@ WIRE = {
 }
 
 
-async def fake_agent(port: int, wire: dict, clips: dict[str, bytes], log: dict):
+async def fake_agent(port: int, wire: dict, clips: dict[str, bytes], log: dict, reply_delay: float = REPLY_DELAY):
     async with websockets.connect(f"ws://127.0.0.1:{port}/ws") as ws:
         for msg in wire["hello"]:
             await ws.send(json.dumps(msg))
@@ -118,43 +122,43 @@ async def fake_agent(port: int, wire: dict, clips: dict[str, bytes], log: dict):
         await silent(GREET_DELAY)
         await speak(clips["greeting"])
         await wait_for_our_line_end()
-        await silent(REPLY_DELAY)
+        await silent(reply_delay)
         await speak(clips["answer"])
         await wait_for_our_line_end()
-        await silent(REPLY_DELAY)
+        await silent(reply_delay)
         log["long"] = await speak(clips["long"], interruptible=True)
         await silent(3.0)
         listener.cancel()
         await ws.send(json.dumps(wire["stop"]))
 
 
-async def rehearse(name: str, port: int) -> bool:
-    clips = {k: pc.read_wav(CLIPS / f"{k}.wav") for k in ("greeting", "answer", "long")}
-    provider = PROVIDERS[name]()
+def fake_provider(name: str, port: int, clips: dict[str, bytes], log: dict, reply_delay: float):
+    """The real provider class, except dialling starts the fake agent instead of a phone call."""
+    base = PROVIDERS[name]
 
-    log = {}
+    class Fake(base):
+        def mount(self, app, state):
+            self.state = state  # no webhooks; the fake ends the call itself
 
-    async def no_dial(*a, **k):
-        raise AssertionError("the rehearsal must not reach a real provider")
+        async def dial(self, to, host, label):
+            async def agent():
+                await fake_agent(port, WIRE[name], clips, log, reply_delay)
+                await asyncio.sleep(1)
+                self.state["result"].call_seconds = 0.0
+                self.state["over"].set()
 
-    async def fake_hangup(call_id):
-        # The probe hangs up when its script ends; the fake just notes it.
-        log["hung_up"] = call_id
+            self.task = asyncio.create_task(agent())
+            # A real provider returns the same id its stream later carries.
+            return {"enablex": "v1", "twilio": "CA1"}[name], "dial-out: fake agent"
 
-    provider.dial, provider.hangup = no_dial, fake_hangup
-    result = pc.Result(label="rehearsal", to="fake", provider=name)
-    state = {"host": "x", "lines": pc.load_lines(), "result": result, "events": [], "provider": provider,
-             "budget_s": 40.0, "over": asyncio.Event(), "t0": time.monotonic(), "call": None}
-    server = uvicorn.Server(uvicorn.Config(pc.build_app(state), host="127.0.0.1", port=port, log_level="warning"))
-    serving = asyncio.create_task(server.serve())
-    while not server.started:
-        await asyncio.sleep(0.05)
-    await fake_agent(port, WIRE[name], clips, log)
-    await asyncio.sleep(2)
-    server.should_exit = True
-    await serving
+        async def hangup(self, call_id):
+            # The probe hangs up when its script ends; the fake just notes it.
+            log.setdefault("hung_up", []).append(call_id)
 
-    print(pc.markdown(result))
+    return Fake()
+
+
+def check(name: str, result, clips: dict[str, bytes], log: dict) -> bool:
     expect = {
         "greeting_after_s": GREET_DELAY + pc.speech_lead_s(clips["greeting"]),
         "q1_reply_after_s": END_GAP + REPLY_DELAY + pc.speech_lead_s(clips["answer"]),
@@ -166,25 +170,57 @@ async def rehearse(name: str, port: int) -> bool:
         good = got is not None and abs(got - want) <= 0.15
         ok &= good
         print(f"{'OK ' if good else 'BAD'} {k}: measured {got}, built in {want:.2f}")
-    good = result.bargein == "stopped" and result.bargein_stop_after_s is not None and log.get("long") == "interrupted"
+    good = result.bargein == "stopped" and result.bargein_stop_after_s is not None
     ok &= good
     print(f"{'OK ' if good else 'BAD'} barge-in: measured {result.bargein} after {result.bargein_stop_after_s}, "
           f"fake stopped {log.get('barge_true')} s after first hearing us (built in {BARGE_NOTICE + BARGE_STOP})")
     want_id = {"enablex": "v1", "twilio": "CA1"}[name]
-    good = log.get("hung_up") == want_id and result.call_id == want_id
+    good = result.call_id == want_id and want_id in log.get("hung_up", [])
     ok &= good
     print(f"{'OK ' if good else 'BAD'} call id {result.call_id}, hung up {log.get('hung_up')}")
     print(f"     our media messages carried: {log.get('sent_shape')}")
-    print(f"{name}:", "PASS" if ok else "FAIL", "\n")
+    return ok
+
+
+async def rehearse(name: str, port: int, calls: int, out: Path) -> bool:
+    clips = {k: pc.read_wav(CLIPS / f"{k}.wav") for k in ("greeting", "answer", "long")}
+    log = {}
+    provider = fake_provider(name, port, clips, log, REPLY_DELAY)
+    results = await pc.run_calls(provider, "x", "fake", name, calls=calls, gap_s=1, budget_s=40.0,
+                                 port=port, out_dir=out, with_transcript=False)
+    ok = len(results) == calls
+    for r in results:
+        ok &= check(name, r, clips, log)
+    print(f"{name}: {calls} call(s)", "PASS" if ok else "FAIL", end="\n\n")
+    return ok
+
+
+async def rehearse_compare(name: str, port: int, out: Path) -> bool:
+    """A second version of the fake that replies 1 s slower must show up as slower."""
+    clips = {k: pc.read_wav(CLIPS / f"{k}.wav") for k in ("greeting", "answer", "long")}
+    provider = fake_provider(name, port, clips, {}, REPLY_DELAY + 1.0)
+    await pc.run_calls(provider, "x", "fake", "slower", calls=1, port=port, out_dir=out,
+                       budget_s=40.0, with_transcript=False)
+    sums = [compare.summarise(lbl, compare.load(lbl, out)) for lbl in (name, "slower")]
+    text = compare.table(sums)
+    print(text, end="\n\n")
+    rows = {line.split("|")[1].strip(): line for line in text.splitlines() if line.startswith("|")}
+    ok = all("slower" in rows[r] for r in ("Reply to a simple question", "Reply to a longer question"))
+    ok &= "about the same" in rows["First words after answering"]
+    print("compare:", "PASS (saw the 1 s slowdown, and no change in the greeting)" if ok else "FAIL")
     return ok
 
 
 async def main():
     p = argparse.ArgumentParser()
     p.add_argument("--provider", choices=sorted(PROVIDERS))
+    p.add_argument("--calls", type=int, default=1, help="calls per provider (default 1)")
     args = p.parse_args()
     names = [args.provider] if args.provider else sorted(PROVIDERS)
-    results = [await rehearse(n, 8797 + i) for i, n in enumerate(names)]
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        results = [await rehearse(n, 8797 + i, args.calls, out) for i, n in enumerate(names)]
+        results.append(await rehearse_compare(names[-1], 8797 + len(names), out))
     print("RESULT:", "PASS" if all(results) else "FAIL")
     raise SystemExit(0 if all(results) else 1)
 

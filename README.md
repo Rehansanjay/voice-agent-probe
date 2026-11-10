@@ -67,7 +67,38 @@ The report prints when the call ends, and is saved with the recording under
 `results/<when>_<label>.{md,json,wav}`.
 
 Call **your own agent**, or one whose owner has published the number as a
-demo line. Each run is one short call of under a minute.
+demo line. Each call is short, under a minute.
+
+## Compare two versions of your agent
+
+One call is one sample, so for a decision, make a few calls under one label per
+version, then compare:
+
+```bash
+python -m probe.call --to +14155550100 --label v1 --calls 3
+# deploy the change
+python -m probe.call --to +14155550100 --label v2 --calls 3
+python -m probe.compare v1 v2
+```
+
+Real output from the rehearsal below, where v2 is the fake agent changed to
+reply 1 s later (one call each):
+
+```
+|                                      | v1      | v2      | Change                  |
+| Calls answered                       | 1 of 1  | 1 of 1  |                         |
+| First words after answering          | 0.85 s  | 0.85 s  | +0.00 s, about the same |
+| Reply to a simple question           | 1.74 s  | 2.59 s  | +0.85 s, slower         |
+| Reply to a longer question           | 1.49 s  | 2.50 s  | +1.01 s, slower         |
+| Stopped after being talked over      | 0.64 s  | 0.62 s  | -0.02 s, about the same |
+| Longest time talking without a break | 3.16 s  | 3.33 s  | +0.17 s, about the same |
+| Stopped when talked over             | 1 of 1  | 1 of 1  |                         |
+| Talked over the caller               | 0 times | 0 times |                         |
+```
+
+Times are medians, with the range beside them. A change under 0.25 s is
+reported as "about the same", since calls vary that much on their own.
+`python -m probe.compare v1` on its own summarises one label's calls.
 
 ### Providers
 
@@ -116,7 +147,10 @@ python -m tests.rehearse
 This plays a stand-in agent over each provider's wire format. The agent
 greets, answers and stops when interrupted on a fixed schedule. No call is
 placed and no account is needed. Measured times land within 0.15 s of the
-built-in ones.
+built-in ones. It then runs a second version of the fake that replies 1 s
+later, and checks that `probe.compare` reports exactly that: both replies
+slower, and the greeting unchanged. Add `--calls 2` to check back-to-back
+calls too.
 
 The barge-in stop reads about 0.25 s early. That is because it marks the last
 moment of speech, and the fake's final syllables before it stops are partly
