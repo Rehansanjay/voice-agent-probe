@@ -25,7 +25,8 @@ right, lined up in time), so you can hear every gap the numbers describe.
 
 ## A sample report
 
-From a call to a Pipecat agent running on EnableX:
+From a test call over EnableX, with a person on a phone playing the agent to
+check the numbers against the recording:
 
 ```
 | Answered the call                          | yes                   |
