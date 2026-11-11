@@ -189,7 +189,9 @@ def check(name: str, result, clips: dict[str, bytes], log: dict, greet_delay: fl
         ok &= good
         print(f"{'OK ' if good else 'BAD'} {k}: measured {got}, built in {want:.2f}")
     good = result.bargein == "stopped" and result.bargein_stop_after_s is not None
+    good = good and result.bargein_first_pause_s is not None and result.bargein_first_pause_s <= result.bargein_stop_after_s + 0.3
     ok &= good
+    print(f"     first pause after being talked over: {result.bargein_first_pause_s}")
     print(f"{'OK ' if good else 'BAD'} barge-in: measured {result.bargein} after {result.bargein_stop_after_s}, "
           f"fake stopped {log.get('barge_true')} s after first hearing us (built in {BARGE_NOTICE + BARGE_STOP})")
     want_id = {"enablex": "v1", "twilio": "CA1"}[name]

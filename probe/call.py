@@ -70,6 +70,7 @@ class Result:
     q1_reply_after_s: float | None = None
     q2_reply_after_s: float | None = None
     bargein: str = "not tested"
+    bargein_first_pause_s: float | None = None
     bargein_stop_after_s: float | None = None
     spoke_over_us: int = 0
     longest_turn_s: float | None = None
@@ -274,7 +275,13 @@ async def run_script(call: Call, result: Result, budget_s: float, answering: boo
                 # Give it up to 4 s from the start of our interruption to stop.
                 while call.now() < t_int + 4.0 and call.det.speaking and not call.closed.is_set():
                     await asyncio.sleep(0.02)
+                pause = call.det.first_pause_after(t_int, t_int + 4.0)
+                if pause is not None:
+                    result.bargein_first_pause_s = round(max(0.0, pause - t_int), 2)
                 end = call.det.speech_end_after(t_int)
+                if end is None and call.det.speaking and call.det.last_speech_end < t_int + 3.7:
+                    # Quiet by the deadline, just not long enough yet to close the span.
+                    end = call.det.last_speech_end
                 if end is not None and end <= t_int + 4.0:
                     result.bargein = "stopped"
                     result.bargein_stop_after_s = round(end - t_int, 2)
@@ -326,7 +333,8 @@ def markdown(r: Result) -> str:
         ("Greeting length", s(r.greeting_len_s)),
         ("Reply to a simple question after", s(r.q1_reply_after_s)),
         ("Reply to a longer question after", s(r.q2_reply_after_s)),
-        ("When talked over", r.bargein + (f", after {r.bargein_stop_after_s:.2f} s" if r.bargein_stop_after_s is not None else "")),
+        ("When talked over", r.bargein + (f", fully quiet after {r.bargein_stop_after_s:.2f} s" if r.bargein_stop_after_s is not None else "")),
+        ("First pause after being talked over", s(r.bargein_first_pause_s)),
         ("Started talking while we were mid-sentence", str(r.spoke_over_us)),
         ("Longest time talking without a break", s(r.longest_turn_s)),
         ("Call length", s(r.call_seconds)),

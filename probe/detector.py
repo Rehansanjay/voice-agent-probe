@@ -53,6 +53,11 @@ class SpeechDetector:
         self._run_start = 0.0
         self._last_speech_end = 0.0
         self.confidences: list[tuple[float, float]] = []
+        self.windows: list[tuple[float, bool]] = []  # (start, was it speech)
+
+    @property
+    def last_speech_end(self) -> float:
+        return self._last_speech_end
 
     @property
     def speaking(self) -> bool:
@@ -75,7 +80,9 @@ class SpeechDetector:
         conf = float(np.asarray(self._vad.voice_confidence(window)).reshape(-1)[0])
         self.confidences.append((t0, conf))
         t1 = t0 + WINDOW_S
-        if conf >= self.threshold and pcm_rms(window) >= self.min_rms:
+        is_speech = conf >= self.threshold and pcm_rms(window) >= self.min_rms
+        self.windows.append((t0, is_speech))
+        if is_speech:
             if self._run == 0:
                 self._run_start = t0
             self._run += 1
@@ -91,6 +98,24 @@ class SpeechDetector:
         """End an open span at the last speech seen, e.g. when the call drops."""
         if self.speaking:
             self.spans[-1].end = self._last_speech_end or at
+
+    def first_pause_after(self, t: float, until: float, min_gap: float = 0.25) -> float | None:
+        """When speech first stopped for at least ``min_gap``, between ``t`` and ``until``.
+
+        A speech span rides over gaps up to end_silence_s, so an agent that stops
+        and then answers looks like one long span. This finds the stop itself.
+        """
+        gap_start = None
+        for t0, is_speech in self.windows:
+            if t0 < t or t0 >= until:
+                continue
+            if is_speech:
+                gap_start = None
+            elif gap_start is None:
+                gap_start = t0
+            if gap_start is not None and t0 + WINDOW_S - gap_start >= min_gap:
+                return gap_start
+        return None
 
     def longest_span(self) -> float:
         return max((s.end - s.start for s in self.spans if s.end is not None), default=0.0)

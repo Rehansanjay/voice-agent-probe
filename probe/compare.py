@@ -19,7 +19,8 @@ TIMINGS = [
     ("greeting_after_s", "First words after answering"),
     ("q1_reply_after_s", "Reply to a simple question"),
     ("q2_reply_after_s", "Reply to a longer question"),
-    ("bargein_stop_after_s", "Stopped after being talked over"),
+    ("bargein_first_pause_s", "First pause after being talked over"),
+    ("bargein_stop_after_s", "Fully quiet after being talked over"),
     ("longest_turn_s", "Longest time talking without a break"),
 ]
 

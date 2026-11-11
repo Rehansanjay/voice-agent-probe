@@ -16,7 +16,7 @@ conversation with it, and times everything from the audio as it arrives:
 | First words after answering | Does the caller sit in silence after pickup? |
 | Reply to a simple question | The gap a caller actually waits through, network included |
 | Reply to a longer question | Whether harder turns are slower |
-| When talked over | Does it stop when interrupted, and how fast? |
+| When talked over | Does it stop when interrupted? The first pause, and when it's fully quiet |
 | Started talking while we were mid-sentence | Is endpointing cutting callers off? |
 | Longest time talking without a break | Monologues that callers can't get a word into |
 
@@ -119,8 +119,7 @@ reply 1 s later (one call each):
 Times are medians, with the range beside them. A change under 0.25 s is
 reported as "about the same". A bigger one is only called slower or faster when
 the two sets of calls don't overlap; otherwise it says "unclear", because the
-same agent can move by more than that between calls. On one real agent, the
-time to stop when interrupted was 0.9 s on one day and 1.6-1.8 s the next.
+same agent can move by more than that between calls.
 `python -m probe.compare v1` on its own summarises one label's calls.
 
 ### Providers
@@ -176,9 +175,12 @@ slower, and the greeting unchanged. It also rehearses `probe.answer`, with
 an agent that speaks first and one that waits for a hello. Add `--calls 2` to
 check back-to-back calls too.
 
-The barge-in stop reads about 0.25 s early. That is because it marks the last
-moment of speech, and the fake's final syllables before it stops are partly
-quiet.
+The barge-in numbers read about 0.25 s early, because they mark the last
+moment of speech and the fake's final syllables before it stops are partly
+quiet. On real calls an agent often stops, then answers the interruption, so
+the report gives both the first pause of 0.25 s or more and the time it went
+fully quiet. A pause inside a sentence can also count as a first pause, so
+listen to the recording before drawing a conclusion from it.
 
 ## Limits
 
