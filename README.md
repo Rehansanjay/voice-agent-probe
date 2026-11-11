@@ -70,6 +70,25 @@ The report prints when the call ends, and is saved with the recording under
 Call **your own agent**, or one whose owner has published the number as a
 demo line. Each call is short, under a minute.
 
+## When the agent calls you
+
+Some demos have no number to dial: you type your number into a form and the
+agent phones you. The probe can pick up instead (Twilio only for now):
+
+```bash
+ngrok http 8765
+python -m probe.answer --label my-agent
+```
+
+In the Twilio console, set your number's "A call comes in" webhook to
+`https://<your tunnel>/twilio/incoming`, then trigger the call. Your Twilio
+number has to be one the agent is able to dial. If the agent stays quiet for
+1.5 s after pickup, the probe says "Hello?", as a person would, and its first
+words are timed from the end of that.
+
+Use a number that is yours, and only on demos a company offers publicly. This
+mode has passed the rehearsal below but has not yet been run on a live call.
+
 ## Compare two versions of your agent
 
 One call is one sample, so for a decision, make a few calls under one label per
@@ -153,8 +172,9 @@ greets, answers and stops when interrupted on a fixed schedule. No call is
 placed and no account is needed. Measured times land within 0.15 s of the
 built-in ones. It then runs a second version of the fake that replies 1 s
 later, and checks that `probe.compare` reports exactly that: both replies
-slower, and the greeting unchanged. Add `--calls 2` to check back-to-back
-calls too.
+slower, and the greeting unchanged. It also rehearses `probe.answer`, with
+an agent that speaks first and one that waits for a hello. Add `--calls 2` to
+check back-to-back calls too.
 
 The barge-in stop reads about 0.25 s early. That is because it marks the last
 moment of speech, and the fake's final syllables before it stops are partly

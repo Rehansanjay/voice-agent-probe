@@ -11,7 +11,9 @@ those, within the 32 ms detector window and a frame or two of pacing.
     python -m tests.rehearse --provider twilio --calls 2
 
 It also runs a second, slower version of the fake agent through the same
-runner and checks that probe.compare reports it as slower.
+runner and checks that probe.compare reports it as slower, and rehearses
+probe.answer: an agent that phones us and speaks first, and one that waits
+for a hello.
 
 Places no calls and needs no accounts.
 """
@@ -25,6 +27,7 @@ import tempfile
 import time
 from pathlib import Path
 
+import aiohttp
 import websockets
 
 import probe.call as pc
@@ -60,7 +63,8 @@ WIRE = {
 }
 
 
-async def fake_agent(port: int, wire: dict, clips: dict[str, bytes], log: dict, reply_delay: float = REPLY_DELAY):
+async def fake_agent(port: int, wire: dict, clips: dict[str, bytes], log: dict, reply_delay: float = REPLY_DELAY,
+                     waits_for_hello: bool = False):
     async with websockets.connect(f"ws://127.0.0.1:{port}/ws") as ws:
         for msg in wire["hello"]:
             await ws.send(json.dumps(msg))
@@ -119,7 +123,11 @@ async def fake_agent(port: int, wire: dict, clips: dict[str, bytes], log: dict, 
                 if last_heard[0] > seen and time.monotonic() - last_heard[0] >= END_GAP:
                     return
 
-        await silent(GREET_DELAY)
+        if waits_for_hello:  # an agent that placed the call and waits for the person to speak
+            await wait_for_our_line_end()
+            await silent(reply_delay)
+        else:
+            await silent(GREET_DELAY)
         await speak(clips["greeting"])
         await wait_for_our_line_end()
         await silent(reply_delay)
@@ -132,20 +140,30 @@ async def fake_agent(port: int, wire: dict, clips: dict[str, bytes], log: dict, 
         await ws.send(json.dumps(wire["stop"]))
 
 
+async def post(port: int, path: str, form: dict[str, str]) -> tuple[int, str]:
+    async with aiohttp.ClientSession() as http:
+        async with http.post(f"http://127.0.0.1:{port}{path}", data=form) as r:
+            return r.status, await r.text()
+
+
 def fake_provider(name: str, port: int, clips: dict[str, bytes], log: dict, reply_delay: float):
     """The real provider class, except dialling starts the fake agent instead of a phone call."""
     base = PROVIDERS[name]
 
     class Fake(base):
         def mount(self, app, state):
-            self.state = state  # no webhooks; the fake ends the call itself
+            self.state = state
+            super().mount(app, state)  # the real webhooks, so they get exercised too
 
         async def dial(self, to, host, label):
             async def agent():
                 await fake_agent(port, WIRE[name], clips, log, reply_delay)
                 await asyncio.sleep(1)
-                self.state["result"].call_seconds = 0.0
-                self.state["over"].set()
+                if name == "twilio":  # the real status webhook has to end the call
+                    await post(port, "/twilio/status", {"CallStatus": "completed", "CallDuration": "12"})
+                else:
+                    self.state["result"].call_seconds = 0.0
+                    self.state["over"].set()
 
             self.task = asyncio.create_task(agent())
             # A real provider returns the same id its stream later carries.
@@ -158,9 +176,9 @@ def fake_provider(name: str, port: int, clips: dict[str, bytes], log: dict, repl
     return Fake()
 
 
-def check(name: str, result, clips: dict[str, bytes], log: dict) -> bool:
+def check(name: str, result, clips: dict[str, bytes], log: dict, greet_delay: float = GREET_DELAY) -> bool:
     expect = {
-        "greeting_after_s": GREET_DELAY + pc.speech_lead_s(clips["greeting"]),
+        "greeting_after_s": greet_delay + pc.speech_lead_s(clips["greeting"]),
         "q1_reply_after_s": END_GAP + REPLY_DELAY + pc.speech_lead_s(clips["answer"]),
         "q2_reply_after_s": END_GAP + REPLY_DELAY + pc.speech_lead_s(clips["long"]),
     }
@@ -191,7 +209,47 @@ async def rehearse(name: str, port: int, calls: int, out: Path) -> bool:
     ok = len(results) == calls
     for r in results:
         ok &= check(name, r, clips, log)
+        if name == "twilio":
+            good = r.call_seconds == 12.0 and r.end_reason == "completed"
+            ok &= good
+            print(f"{'OK ' if good else 'BAD'} status webhook: {r.call_seconds} s, {r.end_reason}")
     print(f"{name}: {calls} call(s)", "PASS" if ok else "FAIL", end="\n\n")
+    return ok
+
+
+async def rehearse_answer(port: int, out: Path, waits_for_hello: bool) -> bool:
+    """The agent phones us: Twilio's real incoming webhook, then the same script."""
+    what = "waits for hello" if waits_for_hello else "speaks first"
+    clips = {k: pc.read_wav(CLIPS / f"{k}.wav") for k in ("greeting", "answer", "long")}
+    log = {}
+    provider = fake_provider("twilio", port, clips, log, REPLY_DELAY)
+    label = "hello" if waits_for_hello else "first"
+    task = asyncio.create_task(pc.answer_calls(provider, "x", label, port=port, out_dir=out, budget_s=40.0,
+                                               with_transcript=False, wait_s=30))
+    caller = {"From": "+919900000000", "CallSid": "CA1"}
+    while True:
+        try:
+            status, twiml = await post(port, "/twilio/incoming", caller)
+            break
+        except aiohttp.ClientConnectorError:
+            await asyncio.sleep(0.05)
+    good = status == 200 and 'Stream url="wss://x/ws"' in twiml
+    ok = good
+    print(f"{'OK ' if good else 'BAD'} incoming webhook: HTTP {status} {twiml}")
+    status, second = await post(port, "/twilio/incoming", caller)
+    good = "Reject" in second
+    ok &= good
+    print(f"{'OK ' if good else 'BAD'} a second caller while busy: {second}")
+
+    await fake_agent(port, WIRE["twilio"], clips, log, waits_for_hello=waits_for_hello)
+    results = await task
+    ok &= len(results) == 1
+    r = results[0]
+    ok &= check("twilio", r, clips, log, END_GAP + REPLY_DELAY if waits_for_hello else GREET_DELAY)
+    good = r.direction == "inbound" and r.to == caller["From"] and r.said_hello_first == waits_for_hello
+    ok &= good
+    print(f"{'OK ' if good else 'BAD'} {r.direction} from {r.to}, said hello first: {r.said_hello_first}")
+    print(f"answer ({what}):", "PASS" if ok else "FAIL", end="\n\n")
     return ok
 
 
@@ -221,6 +279,9 @@ async def main():
         out = Path(tmp)
         results = [await rehearse(n, 8797 + i, args.calls, out) for i, n in enumerate(names)]
         results.append(await rehearse_compare(names[-1], 8797 + len(names), out))
+        if "twilio" in names:
+            results.append(await rehearse_answer(8797 + len(names) + 1, out, waits_for_hello=False))
+            results.append(await rehearse_answer(8797 + len(names) + 2, out, waits_for_hello=True))
     print("RESULT:", "PASS" if all(results) else "FAIL")
     raise SystemExit(0 if all(results) else 1)
 

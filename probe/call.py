@@ -51,7 +51,9 @@ LINES = {
     "q1": "Hi, what can you help me with?",
     "q2": "Okay. Can you explain how that works, step by step?",
     "interrupt": "Sorry, can I stop you there for a second?",
+    "hello": "Hello?",  # only when the agent called us and is waiting for us to speak
 }
+HELLO_AFTER_S = 1.5  # how long a person would wait after picking up before saying hello
 
 
 @dataclass
@@ -59,8 +61,10 @@ class Result:
     label: str
     to: str
     provider: str = ""
+    direction: str = "outbound"  # inbound: the agent called us
     call_id: str | None = None
     answered: bool = False
+    said_hello_first: bool = False
     greeting_after_s: float | None = None
     greeting_len_s: float | None = None
     q1_reply_after_s: float | None = None
@@ -201,8 +205,12 @@ class Call:
         return not self.det.speaking
 
 
-async def run_script(call: Call, result: Result, budget_s: float) -> None:
-    """The scripted conversation. Each step is skipped if the call has ended."""
+async def run_script(call: Call, result: Result, budget_s: float, answering: bool = False) -> None:
+    """The scripted conversation. Each step is skipped if the call has ended.
+
+    answering: the agent placed this call and we picked up. Many agents then
+    wait for the person to say hello, so if it stays quiet we do.
+    """
     await asyncio.wait_for(call.started.wait(), 10)
     answered_at = call.now()
     result.answered = True
@@ -219,11 +227,17 @@ async def run_script(call: Call, result: Result, budget_s: float) -> None:
     # 1. Greeting: most agents speak first. Audio is timestamped by arrival, so
     # a greeting that starts with the stream can land a few ms before the
     # start event; look from just before it.
-    onset = await call.wait_onset(answered_at - 0.5, timeout=min(8.0, left()))
+    timed_from = answered_at
+    onset = await call.wait_onset(answered_at - 0.5, timeout=min(HELLO_AFTER_S if answering else 8.0, left()))
+    if onset is None and answering:
+        hello_start, timed_from = await call.say("hello")
+        result.said_hello_first = True
+        result.notes.append("agent waited for us to say hello; first words are timed from the end of our hello")
+        onset = await call.wait_onset(hello_start, timeout=min(8.0, left()))
     if onset is None:
         result.notes.append("agent said nothing in the first 8 s; we spoke first")
     else:
-        result.greeting_after_s = round(max(0.0, onset - answered_at), 2)
+        result.greeting_after_s = round(max(0.0, onset - timed_from), 2)
         await let_it_finish("greeting")
         span = call.det.spans[0]
         if span.end is not None:
@@ -317,7 +331,8 @@ def markdown(r: Result) -> str:
         ("Longest time talking without a break", s(r.longest_turn_s)),
         ("Call length", s(r.call_seconds)),
     ]
-    out = [f"# {r.label}: call to {r.to} via {r.provider}", "", "| | |", "|---|---|"]
+    way = "call from" if r.direction == "inbound" else "call to"
+    out = [f"# {r.label}: {way} {r.to} via {r.provider}", "", "| | |", "|---|---|"]
     out += [f"| {k} | {v} |" for k, v in rows]
     out += ["", "Times are measured from the call audio as it arrived, so they include the phone network both ways: what a caller hears."]
     if r.notes:
@@ -340,13 +355,18 @@ def build_app(state: dict) -> FastAPI:
         state["call"] = call
         receiver = asyncio.create_task(call.receive())
         try:
-            await run_script(call, state["result"], state["budget_s"])
+            await run_script(call, state["result"], state["budget_s"], state.get("answering", False))
         except Exception as e:
             state["result"].notes.append(f"script stopped: {type(e).__name__}: {e}")
         finally:
             if call.call_id and not call.closed.is_set():
                 await provider.hangup(call.call_id)
             await asyncio.wait([receiver], timeout=5)
+            if state.get("answering"):
+                # No per-call status webhook on a number's incoming calls, so
+                # the stream ending is the end of the call.
+                state["result"].call_seconds = round(call.now(), 2)
+                state["over"].set()
 
     return app
 
@@ -361,6 +381,65 @@ async def ngrok_host() -> str:
     return next((t["public_url"] for t in tunnels if t.get("public_url", "").startswith("https://")), "")
 
 
+async def _serve(state: dict, port: int) -> tuple[uvicorn.Server, asyncio.Task]:
+    server = uvicorn.Server(uvicorn.Config(build_app(state), host="0.0.0.0", port=port, log_level="warning"))
+    serving = asyncio.create_task(server.serve())
+    while not server.started:
+        await asyncio.sleep(0.05)
+    return server, serving
+
+
+async def _save(state: dict, result: Result, out_dir: Path, label: str, run: str, with_transcript: bool) -> None:
+    stem = out_dir / f"{time.strftime('%Y%m%d-%H%M%S')}_{label}{run}"
+    call: Call | None = state["call"]
+    if call is not None:
+        if with_transcript:
+            result.transcript = await transcribe(b"".join(pcm for _, pcm in call.inbound))
+        write_wav(stem.with_suffix(".wav"), call)
+    stem.with_suffix(".json").write_text(
+        json.dumps({**asdict(result), "events": state["events"]}, indent=2), encoding="utf-8"
+    )
+    md = markdown(result)
+    stem.with_suffix(".md").write_text(md, encoding="utf-8")
+    print("\n" + md)
+    print(f"saved {stem}.{{json,md,wav}}")
+
+
+async def answer_calls(
+    provider: Provider, host: str, label: str, *, calls: int = 1, budget_s: float | None = None,
+    port: int = 8765, out_dir: Path = Path("results"), with_transcript: bool = True, wait_s: float = 600.0,
+) -> list[Result]:
+    """Wait for ``calls`` agents to phone us, run the script on each, save a report for each."""
+    def fresh() -> Result:
+        return Result(label=label, to="unknown", provider=provider.name, direction="inbound")
+
+    state = {
+        "host": host, "lines": load_lines(), "provider": provider, "budget_s": budget_s or provider.budget_s,
+        "answering": True, "busy": False,
+        "result": fresh(), "events": [], "over": asyncio.Event(), "t0": time.monotonic(), "call": None,
+    }
+    server, serving = await _serve(state, port)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    results = []
+    try:
+        for i in range(calls):
+            if i:
+                state.update(result=fresh(), events=[], over=asyncio.Event(), t0=time.monotonic(),
+                             call=None, busy=False)
+            print(f"[{i + 1}/{calls}] waiting for the call, up to {wait_s:.0f} s")
+            try:
+                await asyncio.wait_for(state["over"].wait(), timeout=wait_s + state["budget_s"])
+            except TimeoutError:
+                print("no call came in")
+                break
+            await _save(state, state["result"], out_dir, label, f"_{i + 1}" if calls > 1 else "", with_transcript)
+            results.append(state["result"])
+    finally:
+        server.should_exit = True
+        await serving
+    return results
+
+
 async def run_calls(
     provider: Provider, host: str, to: str, label: str, *, calls: int = 1, gap_s: float = 10.0,
     budget_s: float | None = None, port: int = 8765, out_dir: Path = Path("results"),
@@ -372,10 +451,7 @@ async def run_calls(
         "budget_s": budget_s or provider.budget_s,
         "result": None, "events": [], "over": asyncio.Event(), "t0": time.monotonic(), "call": None,
     }
-    server = uvicorn.Server(uvicorn.Config(build_app(state), host="0.0.0.0", port=port, log_level="warning"))
-    serving = asyncio.create_task(server.serve())
-    while not server.started:
-        await asyncio.sleep(0.05)
+    server, serving = await _serve(state, port)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     results = []
@@ -399,20 +475,7 @@ async def run_calls(
                     result.notes.append("the provider never reported the call ending")
                 await asyncio.sleep(1)
 
-            run = f"_{i + 1}" if calls > 1 else ""
-            stem = out_dir / f"{time.strftime('%Y%m%d-%H%M%S')}_{label}{run}"
-            call: Call | None = state["call"]
-            if call is not None:
-                if with_transcript:
-                    result.transcript = await transcribe(b"".join(pcm for _, pcm in call.inbound))
-                write_wav(stem.with_suffix(".wav"), call)
-            stem.with_suffix(".json").write_text(
-                json.dumps({**asdict(result), "events": state["events"]}, indent=2), encoding="utf-8"
-            )
-            md = markdown(result)
-            stem.with_suffix(".md").write_text(md, encoding="utf-8")
-            print("\n" + md)
-            print(f"saved {stem}.{{json,md,wav}}")
+            await _save(state, result, out_dir, label, f"_{i + 1}" if calls > 1 else "", with_transcript)
             results.append(result)
     finally:
         server.should_exit = True

@@ -1,11 +1,13 @@
-"""Regenerate probe/lines/*.wav from the text in probe.call.LINES, with Deepgram TTS.
+"""Generate probe/lines/*.wav from the text in probe.call.LINES, with Deepgram TTS.
 
-    python -m probe.make_lines
+    python -m probe.make_lines            # only the lines that have no recording yet
+    python -m probe.make_lines --force    # all of them
 
 Only needed if you change what the probe says. Any 8 kHz, 16-bit mono wav
 works too, including your own recorded voice.
 """
 
+import argparse
 import asyncio
 import os
 import wave
@@ -30,13 +32,19 @@ async def speak(text: str) -> bytes:
 
 
 async def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--force", action="store_true", help="regenerate lines that already have a recording")
+    args = p.parse_args()
     load_dotenv()
     if not os.environ.get("DEEPGRAM_API_KEY"):
-        raise SystemExit("Set DEEPGRAM_API_KEY to regenerate the lines.")
+        raise SystemExit("Set DEEPGRAM_API_KEY to generate the lines.")
     LINES_DIR.mkdir(exist_ok=True)
     for name, text in LINES.items():
+        path = LINES_DIR / f"{name}.wav"
+        if path.exists() and not args.force:
+            continue
         pcm = await speak(text)
-        with wave.open(str(LINES_DIR / f"{name}.wav"), "wb") as w:
+        with wave.open(str(path), "wb") as w:
             w.setnchannels(1)
             w.setsampwidth(2)
             w.setframerate(RATE)

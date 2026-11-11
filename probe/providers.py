@@ -11,7 +11,7 @@ import base64
 import os
 import time
 from dataclasses import dataclass
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote
 from xml.sax.saxutils import quoteattr
 
 import aiohttp
@@ -38,6 +38,8 @@ class Provider:
     name = ""
     env: tuple[str, ...] = ()
     budget_s = 50.0  # how long the scripted conversation may run
+    answers_calls = False  # can pick up when an agent phones us (probe.answer)
+    answer_note = ""  # for providers that can't
 
     def check_env(self) -> None:
         missing = [k for k in self.env if not os.environ.get(k)]
@@ -61,6 +63,11 @@ class Provider:
         raise NotImplementedError
 
 
+async def _form(request: Request) -> dict[str, str]:
+    """A webhook's urlencoded body. request.form() would need python-multipart."""
+    return {k: v[0] for k, v in parse_qs((await request.body()).decode()).items()}
+
+
 def _digits(number: str) -> str:
     return "".join(c for c in number if c.isdigit())
 
@@ -71,6 +78,7 @@ class EnableX(Provider):
     name = "enablex"
     env = ("ENABLEX_APP_ID", "ENABLEX_APP_KEY", "ENABLEX_FROM_NUMBER")
     budget_s = 40.0
+    answer_note = "Answering incoming calls isn't built for EnableX yet; use --provider twilio."
     api = "https://api.enablex.io/voice/v1/call"
 
     def _headers(self) -> dict:
@@ -152,6 +160,7 @@ class Twilio(Provider):
 
     name = "twilio"
     env = ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM_NUMBER")
+    answers_calls = True
 
     def _url(self, path: str = "") -> str:
         sid = os.environ["TWILIO_ACCOUNT_SID"]
@@ -184,9 +193,22 @@ class Twilio(Provider):
                 await r.read()
 
     def mount(self, app, state):
+        @app.post("/twilio/incoming")
+        async def incoming(request: Request):
+            # Twilio asks this when someone calls our number. One call at a
+            # time: a second caller would overwrite the one being measured.
+            if not state.get("answering") or state.get("busy"):
+                return Response("<Response><Reject /></Response>", media_type="text/xml")
+            state["busy"] = True
+            form = await _form(request)
+            state["result"].to = str(form.get("From") or "unknown")
+            state["result"].call_id = str(form.get("CallSid") or "") or None
+            url = quoteattr(f"wss://{state['host']}/ws")
+            return Response(f"<Response><Connect><Stream url={url} /></Connect></Response>", media_type="text/xml")
+
         @app.post("/twilio/status")
         async def status(request: Request):
-            form = await request.form()
+            form = await _form(request)
             st = form.get("CallStatus")
             state["events"].append((round(time.monotonic() - state["t0"], 2), st))
             if st in ("completed", "busy", "no-answer", "failed", "canceled"):
