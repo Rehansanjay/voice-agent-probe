@@ -138,6 +138,13 @@ The live calls so far went through EnableX. The Twilio path follows Twilio's
 Media Streams format and passes the rehearsal below; if you run it against a
 real Twilio call, I'd like to hear how it went.
 
+## Case study
+
+[**"Sorry, are you still there?" just as the caller starts talking**](case-studies/are-you-still-there.md):
+a real call caught a voice agent prompting callers right as they replied. The
+cause was a timer that started when a reply was generated, not when it finished
+playing. The write-up covers the fix and a before-and-after call.
+
 ## How it measures
 
 - **Speech detection.** Silero VAD scores every 32 ms of incoming audio. A
