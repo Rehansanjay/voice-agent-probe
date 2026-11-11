@@ -98,7 +98,10 @@ reply 1 s later (one call each):
 ```
 
 Times are medians, with the range beside them. A change under 0.25 s is
-reported as "about the same", since calls vary that much on their own.
+reported as "about the same". A bigger one is only called slower or faster when
+the two sets of calls don't overlap; otherwise it says "unclear", because the
+same agent can move by more than that between calls. On one real agent, the
+time to stop when interrupted was 0.9 s on one day and 1.6-1.8 s the next.
 `python -m probe.compare v1` on its own summarises one label's calls.
 
 ### Providers

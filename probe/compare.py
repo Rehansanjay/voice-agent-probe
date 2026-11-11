@@ -23,7 +23,7 @@ TIMINGS = [
     ("longest_turn_s", "Longest time talking without a break"),
 ]
 
-# A change smaller than this is within what call-to-call variation produces.
+# A change smaller than this is too small to call from a handful of calls.
 SAME_WITHIN_S = 0.25
 
 
@@ -74,10 +74,6 @@ def summarise(label: str, runs: list[dict]) -> Summary:
     )
 
 
-def median(xs: list[float]) -> float | None:
-    return statistics.median(xs) if xs else None
-
-
 def cell(xs: list[float]) -> str:
     if not xs:
         return "n/a"
@@ -85,12 +81,16 @@ def cell(xs: list[float]) -> str:
     return m if len(xs) == 1 else f"{m} ({min(xs):.2f}-{max(xs):.2f}, n={len(xs)})"
 
 
-def verdict(a: float | None, b: float | None) -> str:
-    if a is None or b is None:
+def verdict(a: list[float], b: list[float]) -> str:
+    if not a or not b:
         return ""
-    d = b - a
+    d = statistics.median(b) - statistics.median(a)
     if abs(d) < SAME_WITHIN_S:
         return f"{d:+.2f} s, about the same"
+    # The same agent can move by more than this between calls, so a change only
+    # counts when the two sets of calls don't overlap.
+    if min(a) <= max(b) and min(b) <= max(a):
+        return f"{d:+.2f} s, unclear (ranges overlap)"
     return f"{d:+.2f} s, **{'slower' if d > 0 else 'faster'}**"
 
 
@@ -102,7 +102,7 @@ def table(sums: list[Summary]) -> str:
     for key, name in TIMINGS:
         row = [name, *(cell(s.timings[key]) for s in sums)]
         if two:
-            row.append(verdict(median(sums[0].timings[key]), median(sums[1].timings[key])))
+            row.append(verdict(sums[0].timings[key], sums[1].timings[key]))
         rows.append(row)
     rows.append(["Stopped when talked over",
                  *(f"{s.stopped} of {s.barge_tested}" if s.barge_tested else "not tested" for s in sums)]
@@ -111,7 +111,8 @@ def table(sums: list[Summary]) -> str:
     out = ["| " + " | ".join(r) + " |" for r in rows]
     out += ["", "Times are medians across answered calls, with the range and the number of calls beside them."]
     if two:
-        out.append(f"Changes under {SAME_WITHIN_S:.2f} s are within normal call-to-call variation.")
+        out.append(f"Under {SAME_WITHIN_S:.2f} s counts as about the same; a bigger change is only called "
+                   "when the two sets of calls don't overlap.")
     if any(s.answered < 3 for s in sums):
         out.append("Fewer than 3 calls on a side: treat the numbers as a first look, not a verdict.")
     return "\n".join(out)
