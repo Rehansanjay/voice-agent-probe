@@ -60,6 +60,7 @@ LINES = {
     "pin_rest": "zero four one.",
 }
 NUMBER_PAUSE_S = 1.0  # the gap between the two chunks; --pause changes it
+QUIET_BEFORE_S = 1.5  # how long the agent must have been quiet before we start a number
 HELLO_AFTER_S = 1.5  # how long a person would wait after picking up before saying hello
 
 
@@ -335,16 +336,31 @@ async def run_number_script(call: Call, result: Result, budget_s: float, pause_s
     for what, lead, rest in (("mobile number", "num_lead", "num_rest"), ("pin code", "pin_lead", "pin_rest")):
         if left() < 12 or call.closed.is_set():
             break
-        _, lead_end = await call.say(lead)
+        # Agents often pause under a second mid-reply ("let me check... I'm still
+        # looking"). Starting then makes their next sentence look like a cut-in,
+        # so wait for QUIET_BEFORE_S of real quiet first.
+        await call.wait_quiet(timeout=min(20.0, max(0.0, left() - 12)))
+        deadline = call.now() + min(10.0, max(0.0, left() - 12))
+        while call.now() < deadline and not call.closed.is_set() and (
+            call.det.speaking or call.now() - call.det.last_speech_end < QUIET_BEFORE_S
+        ):
+            await asyncio.sleep(0.02)
+        lead_start, lead_end = await call.say(lead)
         # A person pausing mid-number: say nothing, but keep listening.
         while call.now() < lead_end + pause_s and not call.closed.is_set():
             await asyncio.sleep(0.01)
         rest_start, rest_end = await call.say(rest)
-        split = {"what": what, "cut_in_after_s": None, "reply_after_s": None}
+        split = {"what": what, "cut_in_after_s": None, "reply_after_s": None, "unclear": None}
         cut = call.det.first_onset_after(lead_end)
+        # If the agent spoke at all while we read the first chunk, speech in the
+        # pause may just be it finishing its own turn: not a clean test.
+        talked_during = any(lead_start <= t0 < lead_end and sp for t0, sp in call.det.windows)
+        if talked_during:
+            split["unclear"] = "agent was talking while we read the first part"
+            result.notes.append(f"{what}: not a clean test, the agent was talking while we read the first part")
         # Speech that starts in the pause, or so early in the second chunk that the
         # agent must have decided before hearing it, counts as cutting in.
-        if cut is not None and cut < rest_start + 0.2:
+        elif cut is not None and cut < rest_start + 0.2:
             split["cut_in_after_s"] = round(cut - lead_end, 2)
             result.notes.append(
                 f"{what}: agent started talking {cut - lead_end:.2f} s into our {pause_s:.1f} s pause"
@@ -409,7 +425,8 @@ def markdown(r: Result) -> str:
         for sp in r.splits:
             cut = sp["cut_in_after_s"]
             rows.append((f"{sp['what'].capitalize()}: cut in during our pause",
-                         "no, waited" if cut is None else f"YES, {cut:.2f} s into the pause"))
+                         f"unclear: {sp['unclear']}" if sp.get("unclear")
+                         else "no, waited" if cut is None else f"YES, {cut:.2f} s into the pause"))
             rows.append((f"{sp['what'].capitalize()}: reply after we finished", s(sp["reply_after_s"])))
         rows += [("Longest time talking without a break", s(r.longest_turn_s)), ("Call length", s(r.call_seconds))]
     way = "call from" if r.direction == "inbound" else "call to"
