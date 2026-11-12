@@ -64,7 +64,7 @@ WIRE = {
 
 
 async def fake_agent(port: int, wire: dict, clips: dict[str, bytes], log: dict, reply_delay: float = REPLY_DELAY,
-                     waits_for_hello: bool = False):
+                     waits_for_hello: bool = False, number: bool = False, end_gap: float = END_GAP):
     async with websockets.connect(f"ws://127.0.0.1:{port}/ws") as ws:
         for msg in wire["hello"]:
             await ws.send(json.dumps(msg))
@@ -120,8 +120,19 @@ async def fake_agent(port: int, wire: dict, clips: dict[str, bytes], log: dict, 
             seen = last_heard[0]
             while True:
                 await send(silence); await tick()
-                if last_heard[0] > seen and time.monotonic() - last_heard[0] >= END_GAP:
+                if last_heard[0] > seen and time.monotonic() - last_heard[0] >= end_gap:
                     return
+
+        if number:  # --script number: greet, then answer whenever we've been quiet for end_gap
+            await silent(GREET_DELAY)
+            await speak(clips["greeting"])
+            for _ in range(4):
+                await wait_for_our_line_end()
+                await silent(reply_delay)
+                await speak(clips["answer"])
+            listener.cancel()
+            await ws.send(json.dumps(wire["stop"]))
+            return
 
         if waits_for_hello:  # an agent that placed the call and waits for the person to speak
             await wait_for_our_line_end()
@@ -146,7 +157,7 @@ async def post(port: int, path: str, form: dict[str, str]) -> tuple[int, str]:
             return r.status, await r.text()
 
 
-def fake_provider(name: str, port: int, clips: dict[str, bytes], log: dict, reply_delay: float):
+def fake_provider(name: str, port: int, clips: dict[str, bytes], log: dict, reply_delay: float, **agent_kw):
     """The real provider class, except dialling starts the fake agent instead of a phone call."""
     base = PROVIDERS[name]
 
@@ -157,7 +168,7 @@ def fake_provider(name: str, port: int, clips: dict[str, bytes], log: dict, repl
 
         async def dial(self, to, host, label):
             async def agent():
-                await fake_agent(port, WIRE[name], clips, log, reply_delay)
+                await fake_agent(port, WIRE[name], clips, log, reply_delay, **agent_kw)
                 await asyncio.sleep(1)
                 if name == "twilio":  # the real status webhook has to end the call
                     await post(port, "/twilio/status", {"CallStatus": "completed", "CallDuration": "12"})
@@ -255,6 +266,37 @@ async def rehearse_answer(port: int, out: Path, waits_for_hello: bool) -> bool:
     return ok
 
 
+async def rehearse_number(name: str, port: int, out: Path, end_gap: float) -> bool:
+    """--script number against an agent that ends our turn after end_gap of silence.
+
+    Our pause is 1.0 s, so an agent with a 0.3 s gap must be caught cutting in
+    (end_gap + reply delay + clip lead into the pause), and one with 1.5 s must not.
+    """
+    clips = {k: pc.read_wav(CLIPS / f"{k}.wav") for k in ("greeting", "answer", "long")}
+    reply_delay = 0.1
+    provider = fake_provider(name, port, clips, {}, reply_delay, number=True, end_gap=end_gap)
+    [r] = await pc.run_calls(provider, "x", "fake", f"num{end_gap}", calls=1, port=port, out_dir=out,
+                             budget_s=60.0, with_transcript=False, script="number", pause_s=1.0)
+    lead = pc.speech_lead_s(clips["answer"])
+    want = end_gap + reply_delay + lead
+    should_cut = want < 1.0
+    ok = len(r.splits) == 2
+    print(f"{'OK ' if ok else 'BAD'} both numbers tested: {[s['what'] for s in r.splits]}")
+    for s in r.splits:
+        cut = s["cut_in_after_s"]
+        if should_cut:
+            # 0.2 s: the fake's own pacing runs ~0.1 s late (the q1/q2 checks show it
+            # too), and the claim this feeds is yes/no: did it start inside the pause.
+            good = cut is not None and abs(cut - want) <= 0.2 and cut < 1.0
+            print(f"{'OK ' if good else 'BAD'} {s['what']}: cut in {cut} s into the pause, built in {want:.2f}")
+        else:
+            good = cut is None and s["reply_after_s"] is not None and abs(s["reply_after_s"] - want) <= 0.15
+            print(f"{'OK ' if good else 'BAD'} {s['what']}: waited, replied {s['reply_after_s']} s after, built in {want:.2f}")
+        ok &= good
+    print(f"number script, agent gap {end_gap} s:", "PASS" if ok else "FAIL", end="\n\n")
+    return ok
+
+
 async def rehearse_compare(name: str, port: int, out: Path) -> bool:
     """A second version of the fake that replies 1 s slower must show up as slower."""
     clips = {k: pc.read_wav(CLIPS / f"{k}.wav") for k in ("greeting", "answer", "long")}
@@ -281,6 +323,8 @@ async def main():
         out = Path(tmp)
         results = [await rehearse(n, 8797 + i, args.calls, out) for i, n in enumerate(names)]
         results.append(await rehearse_compare(names[-1], 8797 + len(names), out))
+        results.append(await rehearse_number(names[0], 8790, out, end_gap=0.3))
+        results.append(await rehearse_number(names[0], 8791, out, end_gap=1.5))
         if "twilio" in names:
             results.append(await rehearse_answer(8797 + len(names) + 1, out, waits_for_hello=False))
             results.append(await rehearse_answer(8797 + len(names) + 2, out, waits_for_hello=True))

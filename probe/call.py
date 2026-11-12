@@ -52,7 +52,14 @@ LINES = {
     "q2": "Okay. Can you explain how that works, step by step?",
     "interrupt": "Sorry, can I stop you there for a second?",
     "hello": "Hello?",  # only when the agent called us and is waiting for us to speak
+    # --script number: a number read in two chunks with a pause between, the way
+    # people read numbers on the phone. The number is made up.
+    "num_lead": "Hi, I'd like to check my booking. My mobile number is nine eight four zero one",
+    "num_rest": "two three four five six.",
+    "pin_lead": "And the pin code is six zero zero",
+    "pin_rest": "zero four one.",
 }
+NUMBER_PAUSE_S = 1.0  # the gap between the two chunks; --pause changes it
 HELLO_AFTER_S = 1.5  # how long a person would wait after picking up before saying hello
 
 
@@ -77,6 +84,10 @@ class Result:
     call_seconds: float | None = None
     end_reason: str | None = None
     transcript: str | None = None
+    script: str = "default"
+    number_pause_s: float | None = None
+    # --script number: one entry per number read in two chunks
+    splits: list[dict] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
 
@@ -297,6 +308,56 @@ async def run_script(call: Call, result: Result, budget_s: float, answering: boo
     )
 
 
+async def run_number_script(call: Call, result: Result, budget_s: float, pause_s: float = NUMBER_PAUSE_S) -> None:
+    """Read a number in two chunks with a pause between, and see whether the agent
+    jumps in during the pause (it thinks we're done) or waits for the rest."""
+    await asyncio.wait_for(call.started.wait(), 10)
+    answered_at = call.now()
+    result.answered = True
+    result.call_id = result.call_id or call.call_id
+    result.script = "number"
+    result.number_pause_s = pause_s
+
+    def left() -> float:
+        return budget_s - (call.now() - answered_at)
+
+    async def let_it_finish(what: str) -> None:
+        if not await call.wait_quiet(timeout=min(20.0, max(0.0, left() - 8))):
+            result.notes.append(f"agent was still talking after 20 s ({what}); we spoke over it")
+
+    onset = await call.wait_onset(answered_at - 0.5, timeout=min(8.0, left()))
+    if onset is None:
+        result.notes.append("agent said nothing in the first 8 s; we spoke first")
+    else:
+        result.greeting_after_s = round(max(0.0, onset - answered_at), 2)
+        await let_it_finish("greeting")
+
+    for what, lead, rest in (("mobile number", "num_lead", "num_rest"), ("pin code", "pin_lead", "pin_rest")):
+        if left() < 12 or call.closed.is_set():
+            break
+        _, lead_end = await call.say(lead)
+        # A person pausing mid-number: say nothing, but keep listening.
+        while call.now() < lead_end + pause_s and not call.closed.is_set():
+            await asyncio.sleep(0.01)
+        rest_start, rest_end = await call.say(rest)
+        split = {"what": what, "cut_in_after_s": None, "reply_after_s": None}
+        cut = call.det.first_onset_after(lead_end)
+        # Speech that starts in the pause, or so early in the second chunk that the
+        # agent must have decided before hearing it, counts as cutting in.
+        if cut is not None and cut < rest_start + 0.2:
+            split["cut_in_after_s"] = round(cut - lead_end, 2)
+            result.notes.append(
+                f"{what}: agent started talking {cut - lead_end:.2f} s into our {pause_s:.1f} s pause"
+            )
+        onset = await call.wait_onset(rest_end, timeout=min(8.0, left()))
+        if onset is not None:
+            split["reply_after_s"] = round(onset - rest_end, 2)
+        result.splits.append(split)
+        await let_it_finish(f"reply to the {what}")
+
+    result.longest_turn_s = round(call.det.longest_span(), 2) or None
+
+
 def _spans_of(chunks: list[tuple[float, bytes]], gap: float = 0.1) -> list[tuple[float, float]]:
     spans: list[tuple[float, float]] = []
     for t, pcm in chunks:
@@ -339,6 +400,18 @@ def markdown(r: Result) -> str:
         ("Longest time talking without a break", s(r.longest_turn_s)),
         ("Call length", s(r.call_seconds)),
     ]
+    if r.script == "number":
+        rows = [
+            ("Answered the call", "yes" if r.answered else "no"),
+            ("First words after answering", s(r.greeting_after_s)),
+            ("Our pause in the middle of each number", s(r.number_pause_s)),
+        ]
+        for sp in r.splits:
+            cut = sp["cut_in_after_s"]
+            rows.append((f"{sp['what'].capitalize()}: cut in during our pause",
+                         "no, waited" if cut is None else f"YES, {cut:.2f} s into the pause"))
+            rows.append((f"{sp['what'].capitalize()}: reply after we finished", s(sp["reply_after_s"])))
+        rows += [("Longest time talking without a break", s(r.longest_turn_s)), ("Call length", s(r.call_seconds))]
     way = "call from" if r.direction == "inbound" else "call to"
     out = [f"# {r.label}: {way} {r.to} via {r.provider}", "", "| | |", "|---|---|"]
     out += [f"| {k} | {v} |" for k, v in rows]
@@ -363,7 +436,10 @@ def build_app(state: dict) -> FastAPI:
         state["call"] = call
         receiver = asyncio.create_task(call.receive())
         try:
-            await run_script(call, state["result"], state["budget_s"], state.get("answering", False))
+            if state.get("script") == "number":
+                await run_number_script(call, state["result"], state["budget_s"], state.get("pause_s", NUMBER_PAUSE_S))
+            else:
+                await run_script(call, state["result"], state["budget_s"], state.get("answering", False))
         except Exception as e:
             state["result"].notes.append(f"script stopped: {type(e).__name__}: {e}")
         finally:
@@ -451,11 +527,11 @@ async def answer_calls(
 async def run_calls(
     provider: Provider, host: str, to: str, label: str, *, calls: int = 1, gap_s: float = 10.0,
     budget_s: float | None = None, port: int = 8765, out_dir: Path = Path("results"),
-    with_transcript: bool = True,
+    with_transcript: bool = True, script: str = "default", pause_s: float = NUMBER_PAUSE_S,
 ) -> list[Result]:
     """Place ``calls`` calls one after another, saving a report for each."""
     state = {
-        "host": host, "lines": load_lines(), "provider": provider,
+        "host": host, "lines": load_lines(), "provider": provider, "script": script, "pause_s": pause_s,
         "budget_s": budget_s or provider.budget_s,
         "result": None, "events": [], "over": asyncio.Event(), "t0": time.monotonic(), "call": None,
     }
@@ -503,6 +579,11 @@ async def main():
     p.add_argument("--budget", type=float, help="seconds the conversation may run (default: per provider)")
     p.add_argument("--host", help="public host forwarding to this machine; default: the ngrok tunnel")
     p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--script", choices=["default", "number"], default="default",
+                   help="default: greeting, questions, barge-in. number: read a mobile number and a pin code "
+                        "in two chunks each and see if the agent cuts in during the pause")
+    p.add_argument("--pause", type=float, default=NUMBER_PAUSE_S,
+                   help=f"--script number: seconds of pause in the middle of each number (default {NUMBER_PAUSE_S})")
     args = p.parse_args()
     if args.calls < 1:
         raise SystemExit("--calls must be at least 1")
@@ -514,7 +595,7 @@ async def main():
         raise SystemExit("No public host. Start `ngrok http 8765`, or pass --host.")
 
     await run_calls(provider, host, args.to, args.label, calls=args.calls, gap_s=args.gap,
-                    budget_s=args.budget, port=args.port)
+                    budget_s=args.budget, port=args.port, script=args.script, pause_s=args.pause)
     if args.calls > 1:
         print(f"\nsummary: python -m probe.compare {args.label}")
 
