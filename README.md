@@ -70,6 +70,38 @@ The report prints when the call ends, and is saved with the recording under
 Call **your own agent**, or one whose owner has published the number as a
 demo line. Each call is short, under a minute.
 
+## Does it let callers finish a number?
+
+People read phone numbers and PIN codes in chunks: "nine eight four zero one
+... two three four five six". An agent tuned to reply fast can take the pause
+as the end of the turn and answer half a number. This script reads a mobile
+number and a PIN code that way, with a pause in the middle of each:
+
+```bash
+python -m probe.call --to +14155550100 --label my-agent --script number
+python -m probe.call --to +14155550100 --label my-agent --script number --pause 1.5
+```
+
+For each number the report says whether the agent cut in during the pause
+(and how far into it), or waited and how long it took to reply after the
+whole number. Before each number it waits for 1.5 s of real quiet, so an agent
+finishing its own sentence isn't mistaken for a cut-in; if the agent talks
+while the first chunk is read anyway, that number is marked as not a clean
+test.
+
+To send the result to the agent's owner:
+
+```bash
+python -m probe.share results/<when>_my-agent.json --name "My Agent"
+```
+
+This writes one self-contained HTML page (`results/<when>_my-agent_share.html`,
+audio included, under 1 MB) with the verdict for each number and a short clip
+of each moment to listen to. It opens in any browser and can go out as an
+email attachment; nothing is uploaded.
+
+How often this happens, and a fix: [numhold](https://github.com/Rehansanjay/numhold).
+
 ## When the agent calls you
 
 Some demos have no number to dial: you type your number into a form and the
@@ -179,7 +211,9 @@ placed and no account is needed. Measured times land within 0.15 s of the
 built-in ones. It then runs a second version of the fake that replies 1 s
 later, and checks that `probe.compare` reports exactly that: both replies
 slower, and the greeting unchanged. It also rehearses `probe.answer`, with
-an agent that speaks first and one that waits for a hello. Add `--calls 2` to
+an agent that speaks first and one that waits for a hello, and the number
+script against a fake that cuts in after 0.3 s of silence (it must be caught)
+and one that waits 1.5 s (it must not be). Add `--calls 2` to
 check back-to-back calls too.
 
 The barge-in numbers read about 0.25 s early, because they mark the last

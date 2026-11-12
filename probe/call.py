@@ -350,7 +350,8 @@ async def run_number_script(call: Call, result: Result, budget_s: float, pause_s
         while call.now() < lead_end + pause_s and not call.closed.is_set():
             await asyncio.sleep(0.01)
         rest_start, rest_end = await call.say(rest)
-        split = {"what": what, "cut_in_after_s": None, "reply_after_s": None, "unclear": None}
+        split = {"what": what, "cut_in_after_s": None, "reply_after_s": None, "unclear": None,
+                 "at_s": round(lead_start, 2)}  # where it starts in the recording
         cut = call.det.first_onset_after(lead_end)
         # If the agent spoke at all while we read the first chunk, speech in the
         # pause may just be it finishing its own turn: not a clean test.
